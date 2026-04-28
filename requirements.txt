@@ -1,0 +1,5 @@
+Flask
+cryptography
+selenium
+psutil
+webdriver-manager

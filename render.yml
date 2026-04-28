@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: e2ee-bot
+    runtime: image
+    repo: https://github.com/ramu469087/Render-e2ee.git
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.14.3

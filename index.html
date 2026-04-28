@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>E2EE Bot - Facebook Message Automation</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #fff;
+        }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        .header { text-align: center; padding: 20px 0; border-bottom: 1px solid rgba(255,255,255,0.1); margin-bottom: 30px; }
+        .header h1 { font-size: 2rem; background: linear-gradient(135deg, #00d2ff, #3a7bd5); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .stat-card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 15px; padding: 20px; text-align: center; }
+        .stat-value { font-size: 2rem; font-weight: bold; color: #00d2ff; }
+        .stat-label { color: rgba(255,255,255,0.7); margin-top: 5px; }
+        .main-layout { display: grid; grid-template-columns: 1fr 1.5fr; gap: 25px; }
+        @media (max-width: 900px) { .main-layout { grid-template-columns: 1fr; } }
+        .card { background: rgba(255,255,255,0.08); backdrop-filter: blur(10px); border-radius: 20px; padding: 25px; margin-bottom: 25px; }
+        .card h2 { margin-bottom: 20px; font-size: 1.3rem; color: #00d2ff; }
+        input, textarea, select {
+            width: 100%; padding: 12px 15px; margin: 10px 0;
+            background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 10px; color: #fff; font-size: 14px;
+        }
+        input:focus, textarea:focus { outline: none; border-color: #00d2ff; }
+        textarea { resize: vertical; min-height: 100px; }
+        button {
+            background: linear-gradient(135deg, #00d2ff, #3a7bd5);
+            border: none; padding: 12px 25px; border-radius: 10px;
+            color: #fff; font-weight: bold; cursor: pointer; margin: 5px;
+        }
+        button.danger { background: linear-gradient(135deg, #ff4757, #c0392b); }
+        button.warning { background: linear-gradient(135deg, #ffa502, #e67e22); }
+        button.success { background: linear-gradient(135deg, #00b894, #009432); }
+        .task-list { max-height: 500px; overflow-y: auto; }
+        .task-item { background: rgba(255,255,255,0.05); border-radius: 12px; padding: 15px; margin-bottom: 10px; cursor: pointer; }
+        .task-item:hover { background: rgba(255,255,255,0.1); }
+        .task-item.selected { background: rgba(0,210,255,0.2); border-left: 3px solid #00d2ff; }
+        .task-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .task-name { font-weight: bold; font-size: 1.1rem; }
+        .task-status { padding: 4px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: bold; }
+        .status-running { background: #00b894; }
+        .status-stopped { background: #ff4757; }
+        .task-stats { display: flex; gap: 15px; font-size: 0.8rem; color: rgba(255,255,255,0.6); }
+        .logs-container { background: #0a0a0a; border-radius: 10px; padding: 15px; font-family: monospace; font-size: 0.75rem; max-height: 400px; overflow-y: auto; }
+        .log-line { color: #0f0; margin: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.05); padding: 2px 0; }
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); justify-content: center; align-items: center; z-index: 1000; }
+        .modal-content { background: #1a1a2e; border-radius: 20px; padding: 30px; max-width: 500px; width: 90%; }
+        .loading { text-align: center; padding: 20px; }
+        .text-center { text-align: center; }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: rgba(255,255,255,0.1); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb { background: #00d2ff; border-radius: 10px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 E2EE Bot - Facebook Message Automation</h1>
+            <p>Send automated messages to Facebook chats/groups</p>
+        </div>
+        
+        <div class="stats-grid">
+            <div class="stat-card"><div class="stat-value" id="runningCount">0</div><div class="stat-label">Running Tasks</div></div>
+            <div class="stat-card"><div class="stat-value" id="totalTasks">0</div><div class="stat-label">Total Tasks</div></div>
+            <div class="stat-card"><div class="stat-value" id="totalMessages">0</div><div class="stat-label">Messages Sent</div></div>
+            <div class="stat-card"><div class="stat-value" id="memoryUsage">0</div><div class="stat-label">Memory Usage (MB)</div></div>
+        </div>
+        
+        <div class="main-layout">
+            <div>
+                <div class="card">
+                    <h2>📝 Create New Task</h2>
+                    <input type="text" id="taskName" placeholder="Task Name">
+                    <textarea id="cookies" placeholder="Facebook Cookies (one per line)&#10;Example: c_user=1234567890; xs=abc123; datr=xyz789"></textarea>
+                    <input type="text" id="chatId" placeholder="Chat/Thread ID">
+                    <input type="text" id="namePrefix" placeholder="Name Prefix (optional)">
+                    <textarea id="messages" placeholder="Messages (one per line)&#10;Hello!&#10;How are you?"></textarea>
+                    <input type="number" id="delay" placeholder="Delay (seconds)" value="30">
+                    <button class="success" onclick="createTask()">➕ Create Task</button>
+                </div>
+            </div>
+            
+            <div>
+                <div class="card">
+                    <h2>📋 Your Tasks</h2>
+                    <div id="taskList" class="task-list"><div class="loading">Loading tasks...</div></div>
+                </div>
+                
+                <div class="card">
+                    <h2>📊 Task Details & Logs</h2>
+                    <div id="taskDetails"><p class="text-center">Select a task to view details</p></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div id="editModal" class="modal">
+        <div class="modal-content">
+            <h2>✏️ Edit Task</h2>
+            <input type="text" id="editTaskName" placeholder="Task Name">
+            <input type="number" id="editDelay" placeholder="Delay (seconds)">
+            <input type="text" id="editNamePrefix" placeholder="Name Prefix">
+            <button onclick="saveTaskEdit()">💾 Save</button>
+            <button onclick="closeModal()">❌ Cancel</button>
+        </div>
+    </div>
+    
+    <script>
+        let selectedTaskId = null;
+        
+        async function loadStats() {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+                document.getElementById('runningCount').innerText = data.running_tasks || 0;
+                document.getElementById('totalTasks').innerText = data.total_tasks || 0;
+                document.getElementById('totalMessages').innerText = data.total_messages || 0;
+                document.getElementById('memoryUsage').innerText = data.memory_usage_mb || 0;
+            } catch(e) { console.error('Stats error:', e); }
+        }
+        
+        async function loadTasks() {
+            try {
+                const res = await fetch('/api/tasks');
+                const tasks = await res.json();
+                const container = document.getElementById('taskList');
+                if (tasks.length === 0) { container.innerHTML = '<div class="text-center" style="padding:20px;">No tasks created</div>'; return; }
+                container.innerHTML = tasks.map(task => `
+                    <div class="task-item ${selectedTaskId === task.task_id ? 'selected' : ''}" onclick="selectTask('${task.task_id}')">
+                        <div class="task-header"><span class="task-name">📌 ${escapeHtml(task.name)}</span><span class="task-status status-${task.status}">${task.status.toUpperCase()}</span></div>
+                        <div class="task-stats"><span>📨 ${task.messages_sent} msgs</span><span>⏱️ ${task.uptime}</span><span>🍪 ${task.cookies_count} cookies</span></div>
+                        <div><button class="success" style="padding:5px 10px;font-size:12px;" onclick="event.stopPropagation(); startTask('${task.task_id}')">▶ Start</button>
+                        <button class="warning" style="padding:5px 10px;font-size:12px;" onclick="event.stopPropagation(); stopTask('${task.task_id}')">⏹ Stop</button>
+                        <button class="danger" style="padding:5px 10px;font-size:12px;" onclick="event.stopPropagation(); deleteTask('${task.task_id}')">🗑 Delete</button>
+                        <button style="padding:5px 10px;font-size:12px;" onclick="event.stopPropagation(); editTask('${task.task_id}')">✏ Edit</button></div>
+                    </div>
+                `).join('');
+            } catch(e) { console.error('Load tasks error:', e); }
+        }
+        
+        async function selectTask(taskId) {
+            selectedTaskId = taskId;
+            await loadTasks();
+            try {
+                const res = await fetch(`/api/task/${taskId}`);
+                const task = await res.json();
+                const logsHtml = task.logs && task.logs.length ? task.logs.map(log => `<div class="log-line">${escapeHtml(log)}</div>`).join('') : '<div>No logs yet</div>';
+                document.getElementById('taskDetails').innerHTML = `
+                    <div><h3>${escapeHtml(task.task_id)}</h3>
+                    <p>Status: <span class="task-status status-${task.status}">${task.status.toUpperCase()}</span></p>
+                    <p>Messages Sent: ${task.messages_sent}</p><p>Uptime: ${task.uptime}</p>
+                    <p>Chat ID: ${escapeHtml(task.chat_id)}</p><p>Name Prefix: ${escapeHtml(task.name_prefix)}</p>
+                    <p>Delay: ${task.delay}s</p><p>Cookies: ${task.cookies ? task.cookies.length : 0} cookie(s)</p>
+                    <p>Messages: ${task.messages ? task.messages.length : 0} message(s)</p></div>
+                    <div><h4>📜 Live Logs</h4><div class="logs-container" id="liveLogs">${logsHtml}</div></div>
+                `;
+            } catch(e) { console.error('Task details error:', e); }
+        }
+        
+        async function createTask() {
+            const data = {
+                name: document.getElementById('taskName').value || 'Untitled',
+                cookies: document.getElementById('cookies').value,
+                chat_id: document.getElementById('chatId').value,
+                name_prefix: document.getElementById('namePrefix').value,
+                messages: document.getElementById('messages').value,
+                delay: document.getElementById('delay').value
+            };
+            if (!data.cookies || !data.chat_id || !data.messages) { alert('Fill cookies, chat ID, and messages!'); return; }
+            try {
+                const res = await fetch('/api/task/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+                const result = await res.json();
+                if (result.success) {
+                    alert(`Task created: ${result.task_id}`);
+                    document.getElementById('taskName').value = '';
+                    document.getElementById('cookies').value = '';
+                    document.getElementById('chatId').value = '';
+                    document.getElementById('namePrefix').value = '';
+                    document.getElementById('messages').value = '';
+                    document.getElementById('delay').value = '30';
+                    await loadTasks(); await loadStats();
+                }
+            } catch(e) { alert('Error: ' + e.message); }
+        }
+        
+        async function startTask(taskId) { await fetch(`/api/task/${taskId}/start`, { method: 'POST' }); await loadTasks(); await loadStats(); if (selectedTaskId === taskId) await selectTask(taskId); }
+        async function stopTask(taskId) { await fetch(`/api/task/${taskId}/stop`, { method: 'POST' }); await loadTasks(); await loadStats(); if (selectedTaskId === taskId) await selectTask(taskId); }
+        async function deleteTask(taskId) { if (confirm('Delete permanently?')) { await fetch(`/api/task/${taskId}/delete`, { method: 'DELETE' }); if (selectedTaskId === taskId) selectedTaskId = null; await loadTasks(); await loadStats(); if (!selectedTaskId) document.getElementById('taskDetails').innerHTML = '<p class="text-center">Select a task to view details</p>'; } }
+        
+        let editingTaskId = null;
+        async function editTask(taskId) { editingTaskId = taskId; const res = await fetch(`/api/task/${taskId}`); const task = await res.json(); document.getElementById('editTaskName').value = task.task_id; document.getElementById('editDelay').value = task.delay; document.getElementById('editNamePrefix').value = task.name_prefix; document.getElementById('editModal').style.display = 'flex'; }
+        async function saveTaskEdit() { await fetch(`/api/task/${editingTaskId}/update`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: document.getElementById('editTaskName').value, delay: document.getElementById('editDelay').value, name_prefix: document.getElementById('editNamePrefix').value }) }); closeModal(); await loadTasks(); if (selectedTaskId === editingTaskId) await selectTask(editingTaskId); }
+        function closeModal() { document.getElementById('editModal').style.display = 'none'; editingTaskId = null; }
+        function escapeHtml(text) { if (!text) return ''; const div = document.createElement('div'); div.textContent = text; return div.innerHTML; }
+        
+        setInterval(() => { loadStats(); if (selectedTaskId) { fetch(`/api/task/${selectedTaskId}`).then(res => res.json()).then(task => { const logsDiv = document.getElementById('liveLogs'); if (logsDiv && task.logs) logsDiv.innerHTML = task.logs.map(log => `<div class="log-line">${escapeHtml(log)}</div>`).join(''); }).catch(() => {}); } loadTasks(); }, 3000);
+        
+        loadStats(); loadTasks();
+    </script>
+</body>
+</html>
