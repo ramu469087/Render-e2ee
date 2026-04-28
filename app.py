@@ -1,49 +1,53 @@
-from flask import Flask, render_template, request, jsonify
+# bot_webui.py - Flask Web UI with EXACT original bot.py logic
+
 import os
-import threading
+import sys
 import time
 import json
 import random
 import sqlite3
-import psutil
-import gc
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 from collections import deque
+from functools import wraps
 
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
 from cryptography.fernet import Fernet
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 
-app = Flask(__name__)
+# ==================== CONFIGURATION ====================
+SECRET_KEY = "TERI MA KI CHUT MDC"
+CODE = "03102003"
+MAX_TASKS = 50
+PORT = int(os.environ.get("PORT", 5000))
 
-# Configuration - EXACT COPY
-MAX_TASKS = 100
 DB_PATH = Path(__file__).parent / 'bot_data.db'
 ENCRYPTION_KEY_FILE = Path(__file__).parent / '.encryption_key'
 
-# Store logs like main.py - last 100 logs
+# Logs storage
 task_logs = {}
 
 def log_message(task_id: str, msg: str):
-    """Log message like main.py format: [HH:MM:SS] message"""
     timestamp = time.strftime("%H:%M:%S")
     formatted_msg = f"[{timestamp}] {msg}"
     
     if task_id not in task_logs:
-        task_logs[task_id] = deque(maxlen=100)
+        task_logs[task_id] = deque(maxlen=200)
     
     task_logs[task_id].append(formatted_msg)
     
-    with open('bot.log', 'a') as f:
-        f.write(f"{formatted_msg}\n")
+    if "ERROR" in msg or "Fatal" in msg:
+        with open('bot.log', 'a') as f:
+            f.write(f"{formatted_msg}\n")
     
     print(formatted_msg)
 
-# Encryption setup - EXACT COPY
+# ==================== ENCRYPTION ====================
 def get_encryption_key():
     if ENCRYPTION_KEY_FILE.exists():
         with open(ENCRYPTION_KEY_FILE, 'rb') as f:
@@ -70,26 +74,24 @@ def decrypt_data(encrypted_data):
     except:
         return ""
 
-# Database setup - EXACT COPY
+# ==================== DATABASE ====================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    cursor.execute('PRAGMA journal_mode=WAL')
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id TEXT UNIQUE NOT NULL,
-            username TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            secret_key_verified INTEGER DEFAULT 0
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL
         )
     ''')
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_id TEXT UNIQUE NOT NULL,
-            telegram_id TEXT NOT NULL,
+            task_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
             cookies_encrypted TEXT,
             chat_id TEXT,
             name_prefix TEXT,
@@ -97,23 +99,30 @@ def init_db():
             delay INTEGER DEFAULT 30,
             status TEXT DEFAULT 'stopped',
             messages_sent INTEGER DEFAULT 0,
-            current_cookie_index INTEGER DEFAULT 0,
             start_time TIMESTAMP,
             last_active TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
+    # Create default admin user
+    import hashlib
+    cursor.execute('SELECT * FROM users WHERE username = "admin"')
+    if not cursor.fetchone():
+        password_hash = hashlib.sha256("admin123".encode()).hexdigest()
+        cursor.execute('INSERT INTO users (username, password_hash) VALUES (?, ?)', 
+                      ('admin', password_hash))
     
     conn.commit()
     conn.close()
 
 init_db()
 
+# ==================== TASK CLASS ====================
 @dataclass
 class Task:
     task_id: str
-    telegram_id: str
+    username: str
     cookies: List[str]
     chat_id: str
     name_prefix: str
@@ -121,7 +130,6 @@ class Task:
     delay: int
     status: str
     messages_sent: int
-    current_cookie_index: int
     start_time: Optional[datetime]
     last_active: Optional[datetime]
     running: bool = False
@@ -139,22 +147,17 @@ class Task:
             return f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
+# ==================== TASK MANAGER (EXACT ORIGINAL LOGIC) ====================
 class TaskManager:
     def __init__(self):
         self.tasks: Dict[str, Task] = {}
         self.task_threads: Dict[str, threading.Thread] = {}
         self.load_tasks_from_db()
-        self.start_auto_resume()
-        self.start_memory_cleaner()
     
     def load_tasks_from_db(self):
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT task_id, telegram_id, cookies_encrypted, chat_id, name_prefix, messages, 
-                   delay, status, messages_sent, current_cookie_index, start_time, last_active
-            FROM tasks
-        ''')
+        cursor.execute('SELECT * FROM tasks')
         for row in cursor.fetchall():
             try:
                 cookies = json.loads(decrypt_data(row[2])) if row[2] else []
@@ -162,7 +165,7 @@ class TaskManager:
                 
                 task = Task(
                     task_id=row[0],
-                    telegram_id=row[1],
+                    username=row[1],
                     cookies=cookies,
                     chat_id=row[3] or "",
                     name_prefix=row[4] or "",
@@ -170,13 +173,14 @@ class TaskManager:
                     delay=row[6] or 30,
                     status=row[7] or "stopped",
                     messages_sent=row[8] or 0,
-                    current_cookie_index=row[9] or 0,
-                    start_time=datetime.fromisoformat(row[10]) if row[10] else None,
-                    last_active=datetime.fromisoformat(row[11]) if row[11] else None
+                    start_time=datetime.fromisoformat(row[9]) if row[9] else None,
+                    last_active=datetime.fromisoformat(row[10]) if row[10] else None
                 )
                 self.tasks[task.task_id] = task
+                if task.status == "running":
+                    self.start_task(task.task_id)
             except Exception as e:
-                print(f"Error loading task {row[0]}: {e}")
+                print(f"Error loading task: {e}")
         conn.close()
     
     def save_task(self, task: Task):
@@ -184,12 +188,12 @@ class TaskManager:
         cursor = conn.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO tasks 
-            (task_id, telegram_id, cookies_encrypted, chat_id, name_prefix, messages, 
-             delay, status, messages_sent, current_cookie_index, start_time, last_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (task_id, username, cookies_encrypted, chat_id, name_prefix, messages, 
+             delay, status, messages_sent, start_time, last_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             task.task_id,
-            task.telegram_id,
+            task.username,
             encrypt_data(json.dumps(task.cookies)),
             task.chat_id,
             task.name_prefix,
@@ -197,7 +201,6 @@ class TaskManager:
             task.delay,
             task.status,
             task.messages_sent,
-            task.current_cookie_index,
             task.start_time.isoformat() if task.start_time else None,
             task.last_active.isoformat() if task.last_active else None
         ))
@@ -249,7 +252,7 @@ class TaskManager:
         return True
     
     def _setup_browser(self, task_id: str):
-        """EXACT SAME as original bot.py"""
+        """EXACT SAME as original bot.py - WORKING VERSION"""
         chrome_options = Options()
         chrome_options.add_argument('--headless=new')
         chrome_options.add_argument('--no-sandbox')
@@ -260,9 +263,11 @@ class TaskManager:
         chrome_options.add_argument('--window-size=1920,1080')
         chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36')
         
+        # Ghost mode - no active status
         chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
         
+        # Try to find Chromium binary
         chromium_paths = [
             '/usr/bin/chromium',
             '/usr/bin/chromium-browser',
@@ -276,6 +281,7 @@ class TaskManager:
                 log_message(task_id, f'Found Chromium at: {chromium_path}')
                 break
         
+        # Try to find ChromeDriver
         chromedriver_paths = [
             '/usr/bin/chromedriver',
             '/usr/local/bin/chromedriver'
@@ -300,6 +306,7 @@ class TaskManager:
                 log_message(task_id, 'Chrome started with default driver!')
             
             driver.set_window_size(1920, 1080)
+            log_message(task_id, 'Chrome browser setup completed successfully!')
             return driver
             
         except Exception as error:
@@ -317,7 +324,7 @@ class TaskManager:
                 raise error
     
     def _find_message_input(self, driver, task_id: str, process_id: str):
-        """EXACT SAME as original bot.py - NO CHANGE"""
+        """EXACT SAME as original bot.py"""
         log_message(task_id, f"{process_id}: Finding message input...")
         
         try:
@@ -381,24 +388,8 @@ class TaskManager:
         log_message(task_id, f"{process_id}: ❌ Message input not found!")
         return None
     
-    def _run_task(self, task_id: str):
-        task = self.tasks[task_id]
-        task.running = True
-        process_id = f"TASK-{task_id[-6:]}"
-        
-        while task.status == "running" and not task.stop_flag:
-            try:
-                self._send_messages(task, process_id)
-            except Exception as e:
-                log_message(task_id, f"ERROR: {str(e)[:100]}")
-                time.sleep(5)
-        
-        task.running = False
-        if task_id in self.task_threads:
-            del self.task_threads[task_id]
-    
     def _send_messages(self, task: Task, process_id: str):
-        """EXACT SAME as original bot.py - COPY PASTE, NO CHANGES"""
+        """EXACT SAME send_messages function from original bot.py"""
         driver = None
         message_rotation_index = 0
         task_id = task.task_id
@@ -411,6 +402,7 @@ class TaskManager:
             driver.get('https://www.facebook.com/')
             time.sleep(8)
             
+            # Use first cookie (single cookie mode like original)
             current_cookie = task.cookies[0] if task.cookies else ""
             
             if current_cookie and current_cookie.strip():
@@ -448,7 +440,7 @@ class TaskManager:
             if not message_input:
                 task.status = "stopped"
                 self.save_task(task)
-                return
+                return 0
             
             delay = int(task.delay)
             messages_sent = 0
@@ -533,11 +525,13 @@ class TaskManager:
                     time.sleep(5)
             
             log_message(task_id, f"{process_id}: Automation stopped. Total messages: {messages_sent}")
+            return messages_sent
             
         except Exception as e:
             log_message(task_id, f"{process_id}: Fatal error: {str(e)}")
             task.status = "stopped"
             self.save_task(task)
+            return 0
         finally:
             if driver:
                 try:
@@ -546,150 +540,519 @@ class TaskManager:
                 except:
                     pass
     
-    def start_auto_resume(self):
-        def auto_resume():
-            while True:
-                try:
-                    for task_id, task in self.tasks.items():
-                        if task.status == "running" and not task.running:
-                            self.start_task(task_id)
-                except Exception as e:
-                    print(f"Auto resume error: {e}")
-                time.sleep(60)
+    def _run_task(self, task_id: str):
+        task = self.tasks[task_id]
+        task.running = True
+        process_id = f"TASK-{task_id[-6:]}"
         
-        threading.Thread(target=auto_resume, daemon=True).start()
-    
-    def start_memory_cleaner(self):
-        def clean_memory():
-            while True:
-                time.sleep(3600)
-                try:
-                    gc.collect()
-                    process = psutil.Process()
-                    memory_mb = process.memory_info().rss / 1024 / 1024
-                    log_message("SYSTEM", f"Memory cleaned: {memory_mb:.1f} MB used")
-                except Exception as e:
-                    print(f"Memory clean error: {e}")
+        while task.status == "running" and not task.stop_flag:
+            try:
+                self._send_messages(task, process_id)
+            except Exception as e:
+                log_message(task_id, f"ERROR: {str(e)[:100]}")
+                time.sleep(5)
         
-        threading.Thread(target=clean_memory, daemon=True).start()
+        task.running = False
+        if task_id in self.task_threads:
+            del self.task_threads[task_id]
 
 task_manager = TaskManager()
 
-# Flask Routes
+# ==================== FLASK WEB UI ====================
+app = Flask(__name__)
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'your-secret-key-here')
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'logged_in' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# HTML Template
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Facebook Message Bot - Control Panel</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .header {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .header h1 { color: #667eea; font-size: 24px; }
+        .logout-btn {
+            background: #dc3545;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            text-decoration: none;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            text-align: center;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .stat-card h3 { color: #666; font-size: 14px; margin-bottom: 10px; }
+        .stat-card .value { font-size: 32px; font-weight: bold; color: #667eea; }
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .card {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .card h2 {
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 20px;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; color: #666; font-weight: 500; }
+        input, textarea, select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        textarea { resize: vertical; min-height: 100px; }
+        button {
+            background: #667eea;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-right: 10px;
+        }
+        button:hover { background: #5a67d8; }
+        button.danger { background: #dc3545; }
+        button.success { background: #28a745; }
+        button.warning { background: #ffc107; color: #333; }
+        .task-list { margin-top: 20px; }
+        .task-item {
+            background: #f8f9fa;
+            border-radius: 5px;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-left: 4px solid #667eea;
+            cursor: pointer;
+        }
+        .task-item.running { border-left-color: #28a745; }
+        .task-item.stopped { border-left-color: #dc3545; }
+        .task-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .task-id { font-weight: bold; color: #333; }
+        .task-status {
+            padding: 3px 10px;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .status-running { background: #d4edda; color: #155724; }
+        .status-stopped { background: #f8d7da; color: #721c24; }
+        .task-details { font-size: 12px; color: #666; margin-bottom: 10px; }
+        .task-actions button { padding: 5px 10px; font-size: 12px; margin-right: 5px; }
+        .logs {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            border-radius: 5px;
+            padding: 15px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            height: 400px;
+            overflow-y: auto;
+        }
+        .log-line { margin-bottom: 5px; white-space: pre-wrap; word-wrap: break-word; }
+        .log-error { color: #f48771; }
+        .refresh-btn { float: right; padding: 5px 10px; font-size: 12px; }
+        @media (max-width: 768px) { .main-content { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 Facebook Message Bot</h1>
+            <a href="/logout" class="logout-btn">Logout</a>
+        </div>
+        
+        <div class="stats">
+            <div class="stat-card"><h3>Total Tasks</h3><div class="value" id="totalTasks">0</div></div>
+            <div class="stat-card"><h3>Running Tasks</h3><div class="value" id="runningTasks">0</div></div>
+            <div class="stat-card"><h3>Stopped Tasks</h3><div class="value" id="stoppedTasks">0</div></div>
+            <div class="stat-card"><h3>Total Messages</h3><div class="value" id="totalMessages">0</div></div>
+        </div>
+        
+        <div class="main-content">
+            <div class="card">
+                <h2>➕ Create New Task</h2>
+                <form id="createTaskForm">
+                    <div class="form-group">
+                        <label>Chat Thread ID</label>
+                        <input type="text" name="chat_id" required placeholder="e.g., 1362400298935018">
+                    </div>
+                    <div class="form-group">
+                        <label>Name Prefix (optional)</label>
+                        <input type="text" name="name_prefix" placeholder="e.g., John">
+                    </div>
+                    <div class="form-group">
+                        <label>Messages (one per line)</label>
+                        <textarea name="messages" required placeholder="Hello!&#10;How are you?&#10;Nice to meet you!"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>Delay (seconds)</label>
+                        <input type="number" name="delay" value="30" min="10">
+                    </div>
+                    <div class="form-group">
+                        <label>Facebook Cookies</label>
+                        <textarea name="cookies" required placeholder="c_user=1234567890; xs=789012%3Aabc123; datr=abc123"></textarea>
+                    </div>
+                    <button type="submit">Create & Start Task</button>
+                </form>
+            </div>
+            
+            <div class="card">
+                <h2>📋 Tasks</h2>
+                <div id="tasksList" class="task-list">Loading...</div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>📄 Task Logs <button class="refresh-btn" onclick="refreshLogs()">Refresh</button></h2>
+            <div class="logs" id="logsContainer"><div class="log-line">Select a task to view logs...</div></div>
+        </div>
+    </div>
+    
+    <script>
+        let currentTaskId = null;
+        
+        function loadStats() {
+            fetch('/api/stats').then(res => res.json()).then(data => {
+                document.getElementById('totalTasks').textContent = data.total_tasks;
+                document.getElementById('runningTasks').textContent = data.running_tasks;
+                document.getElementById('stoppedTasks').textContent = data.stopped_tasks;
+                document.getElementById('totalMessages').textContent = data.total_messages;
+            });
+        }
+        
+        function loadTasks() {
+            fetch('/api/tasks').then(res => res.json()).then(tasks => {
+                const container = document.getElementById('tasksList');
+                if (tasks.length === 0) {
+                    container.innerHTML = '<p style="text-align: center; color: #666;">No tasks created yet</p>';
+                    return;
+                }
+                container.innerHTML = tasks.map(task => `
+                    <div class="task-item ${task.status}" onclick="selectTask('${task.task_id}')">
+                        <div class="task-header">
+                            <span class="task-id">${task.task_id}</span>
+                            <span class="task-status status-${task.status}">${task.status.toUpperCase()}</span>
+                        </div>
+                        <div class="task-details">
+                            Chat: ${task.chat_id} | Sent: ${task.messages_sent} msgs | Uptime: ${task.uptime}
+                        </div>
+                        <div class="task-actions" onclick="event.stopPropagation()">
+                            ${task.status === 'running' ? 
+                                `<button class="warning" onclick="stopTask('${task.task_id}')">⏸ Stop</button>` :
+                                `<button class="success" onclick="startTask('${task.task_id}')">▶ Start</button>`
+                            }
+                            <button class="danger" onclick="deleteTask('${task.task_id}')">🗑 Delete</button>
+                        </div>
+                    </div>
+                `).join('');
+            });
+        }
+        
+        function selectTask(taskId) { currentTaskId = taskId; refreshLogs(); }
+        
+        function refreshLogs() {
+            if (!currentTaskId) return;
+            fetch(`/api/logs/${currentTaskId}`).then(res => res.json()).then(data => {
+                const container = document.getElementById('logsContainer');
+                if (data.logs.length === 0) {
+                    container.innerHTML = '<div class="log-line">No logs available</div>';
+                    return;
+                }
+                container.innerHTML = data.logs.map(log => {
+                    const isError = log.includes('ERROR') || log.includes('Fatal');
+                    return `<div class="log-line ${isError ? 'log-error' : ''}">${escapeHtml(log)}</div>`;
+                }).join('');
+                container.scrollTop = container.scrollHeight;
+            });
+        }
+        
+        function startTask(taskId) { fetch(`/api/tasks/${taskId}/start`, { method: 'POST' }).then(() => { loadTasks(); loadStats(); }); }
+        function stopTask(taskId) { fetch(`/api/tasks/${taskId}/stop`, { method: 'POST' }).then(() => { loadTasks(); loadStats(); }); }
+        
+        function deleteTask(taskId) {
+            if (confirm('Delete this task?')) {
+                fetch(`/api/tasks/${taskId}`, { method: 'DELETE' }).then(() => {
+                    if (currentTaskId === taskId) { currentTaskId = null; document.getElementById('logsContainer').innerHTML = '<div class="log-line">Select a task to view logs...</div>'; }
+                    loadTasks(); loadStats();
+                });
+            }
+        }
+        
+        function escapeHtml(text) { const div = document.createElement('div'); div.textContent = text; return div.innerHTML; }
+        
+        document.getElementById('createTaskForm').addEventListener('submit', (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const data = {
+                chat_id: formData.get('chat_id'),
+                name_prefix: formData.get('name_prefix'),
+                messages: formData.get('messages').split('\\n').filter(m => m.trim()),
+                delay: parseInt(formData.get('delay')),
+                cookies: formData.get('cookies')
+            };
+            fetch('/api/tasks/create', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            }).then(res => res.json()).then(result => {
+                if (result.success) { alert('Task created!'); e.target.reset(); loadTasks(); loadStats(); }
+                else { alert('Error: ' + result.error); }
+            });
+        });
+        
+        setInterval(() => { loadStats(); loadTasks(); if (currentTaskId) refreshLogs(); }, 3000);
+        loadStats(); loadTasks();
+    </script>
+</body>
+</html>
+'''
+
+LOGIN_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Login - Facebook Bot</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        .login-container {
+            background: white;
+            border-radius: 10px;
+            padding: 40px;
+            width: 350px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }
+        h1 { color: #667eea; text-align: center; margin-bottom: 30px; }
+        input { width: 100%; padding: 12px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 5px; }
+        button { width: 100%; padding: 12px; background: #667eea; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        button:hover { background: #5a67d8; }
+        .error { color: #dc3545; text-align: center; margin-top: 10px; }
+        .info { text-align: center; margin-top: 20px; font-size: 12px; color: #666; }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <h1>🤖 Bot Login</h1>
+        <form method="POST">
+            <input type="text" name="username" placeholder="Username" required>
+            <input type="password" name="password" placeholder="Password" required>
+            <button type="submit">Login</button>
+            {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        </form>
+        <div class="info">Default: admin / admin123</div>
+    </div>
+</body>
+</html>
+'''
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        import hashlib
+        username = request.form.get('username')
+        password = request.form.get('password')
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE username = ? AND password_hash = ?', (username, password_hash))
+        user = cursor.fetchone()
+        conn.close()
+        
+        if user:
+            session['logged_in'] = True
+            session['username'] = username
+            return redirect(url_for('index'))
+        else:
+            return render_template_string(LOGIN_TEMPLATE, error='Invalid credentials')
+    
+    return render_template_string(LOGIN_TEMPLATE)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
 @app.route('/')
+@login_required
 def index():
-    return render_template('index.html')
+    return render_template_string(HTML_TEMPLATE)
+
+# API Routes
+@app.route('/api/stats')
+@login_required
+def api_stats():
+    tasks = task_manager.tasks.values()
+    username = session.get('username')
+    user_tasks = [t for t in tasks if t.username == username]
+    return jsonify({
+        'total_tasks': len(user_tasks),
+        'running_tasks': sum(1 for t in user_tasks if t.status == 'running'),
+        'stopped_tasks': sum(1 for t in user_tasks if t.status == 'stopped'),
+        'total_messages': sum(t.messages_sent for t in user_tasks)
+    })
 
 @app.route('/api/tasks')
-def get_tasks():
-    tasks = []
-    for task_id, task in task_manager.tasks.items():
-        tasks.append({
-            'task_id': task.task_id,
-            'status': task.status,
-            'messages_sent': task.messages_sent,
-            'uptime': task.get_uptime(),
-            'cookies_count': len(task.cookies),
-            'messages_count': len(task.messages),
-            'name': task.task_id
-        })
-    return jsonify(tasks)
+@login_required
+def api_tasks():
+    username = session.get('username')
+    tasks = [t for t in task_manager.tasks.values() if t.username == username]
+    return jsonify([{
+        'task_id': t.task_id,
+        'status': t.status,
+        'chat_id': t.chat_id,
+        'messages_sent': t.messages_sent,
+        'uptime': t.get_uptime(),
+        'delay': t.delay
+    } for t in tasks])
 
-@app.route('/api/task/<task_id>')
-def get_task(task_id):
-    if task_id not in task_manager.tasks:
-        return jsonify({'error': 'Task not found'}), 404
-    
-    task = task_manager.tasks[task_id]
-    logs = list(task_logs.get(task_id, []))
-    
-    return jsonify({
-        'task_id': task.task_id,
-        'status': task.status,
-        'messages_sent': task.messages_sent,
-        'uptime': task.get_uptime(),
-        'chat_id': task.chat_id,
-        'name_prefix': task.name_prefix,
-        'delay': task.delay,
-        'cookies': task.cookies,
-        'messages': task.messages,
-        'logs': logs[-30:]
-    })
-
-@app.route('/api/task/create', methods=['POST'])
-def create_task():
+@app.route('/api/tasks/create', methods=['POST'])
+@login_required
+def api_create_task():
     data = request.json
-    
-    task_id = f"rajmishra_{random.randint(10000, 99999)}"
-    
-    cookies = [c.strip() for c in data.get('cookies', '').split('\n') if c.strip()]
-    messages = [m.strip() for m in data.get('messages', '').split('\n') if m.strip()]
-    
-    task = Task(
-        task_id=task_id,
-        telegram_id="web_user",
-        cookies=cookies,
-        chat_id=data.get('chat_id', ''),
-        name_prefix=data.get('name_prefix', ''),
-        messages=messages,
-        delay=int(data.get('delay', 30)),
-        status="stopped",
-        messages_sent=0,
-        current_cookie_index=0,
-        start_time=None,
-        last_active=None
-    )
-    
-    task_manager.tasks[task_id] = task
-    task_manager.save_task(task)
-    
-    return jsonify({'success': True, 'task_id': task_id})
-
-@app.route('/api/task/<task_id>/start', methods=['POST'])
-def start_task_route(task_id):
-    if task_id not in task_manager.tasks:
-        return jsonify({'error': 'Task not found'}), 404
-    
-    if task_manager.start_task(task_id):
-        return jsonify({'success': True})
-    return jsonify({'error': 'Failed to start task'}), 400
-
-@app.route('/api/task/<task_id>/stop', methods=['POST'])
-def stop_task_route(task_id):
-    if task_id not in task_manager.tasks:
-        return jsonify({'error': 'Task not found'}), 404
-    
-    task_manager.stop_task(task_id)
-    return jsonify({'success': True})
-
-@app.route('/api/task/<task_id>/delete', methods=['DELETE'])
-def delete_task_route(task_id):
-    if task_id not in task_manager.tasks:
-        return jsonify({'error': 'Task not found'}), 404
-    
-    task_manager.delete_task(task_id)
-    return jsonify({'success': True})
-
-@app.route('/api/stats')
-def get_stats():
-    running = len([t for t in task_manager.tasks.values() if t.status == 'running'])
-    total = len(task_manager.tasks)
-    total_messages = sum(t.messages_sent for t in task_manager.tasks.values())
+    username = session.get('username')
     
     try:
-        process = psutil.Process()
-        memory_mb = process.memory_info().rss / 1024 / 1024
-    except:
-        memory_mb = 0
-    
-    return jsonify({
-        'running_tasks': running,
-        'total_tasks': total,
-        'total_messages': total_messages,
-        'memory_usage_mb': round(memory_mb, 1),
-        'max_tasks': MAX_TASKS
-    })
+        task_id = f"task_{random.randint(10000, 99999)}"
+        cookies = [data.get('cookies', '')]
+        messages = data.get('messages', ['Hello!'])
+        
+        task = Task(
+            task_id=task_id,
+            username=username,
+            cookies=cookies,
+            chat_id=data.get('chat_id', ''),
+            name_prefix=data.get('name_prefix', ''),
+            messages=messages,
+            delay=int(data.get('delay', 30)),
+            status='stopped',
+            messages_sent=0,
+            start_time=None,
+            last_active=None
+        )
+        
+        task_manager.tasks[task_id] = task
+        task_manager.save_task(task)
+        task_manager.start_task(task_id)
+        
+        return jsonify({'success': True, 'task_id': task_id})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+
+@app.route('/api/tasks/<task_id>/start', methods=['POST'])
+@login_required
+def api_start_task(task_id):
+    if task_id not in task_manager.tasks:
+        return jsonify({'error': 'Task not found'}), 404
+    if task_manager.tasks[task_id].username != session.get('username'):
+        return jsonify({'error': 'Unauthorized'}), 403
+    if task_manager.start_task(task_id):
+        return jsonify({'success': True})
+    return jsonify({'error': 'Failed to start'}), 400
+
+@app.route('/api/tasks/<task_id>/stop', methods=['POST'])
+@login_required
+def api_stop_task(task_id):
+    if task_id not in task_manager.tasks:
+        return jsonify({'error': 'Task not found'}), 404
+    if task_manager.tasks[task_id].username != session.get('username'):
+        return jsonify({'error': 'Unauthorized'}), 403
+    if task_manager.stop_task(task_id):
+        return jsonify({'success': True})
+    return jsonify({'error': 'Failed to stop'}), 400
+
+@app.route('/api/tasks/<task_id>', methods=['DELETE'])
+@login_required
+def api_delete_task(task_id):
+    if task_id not in task_manager.tasks:
+        return jsonify({'error': 'Task not found'}), 404
+    if task_manager.tasks[task_id].username != session.get('username'):
+        return jsonify({'error': 'Unauthorized'}), 403
+    if task_manager.delete_task(task_id):
+        return jsonify({'success': True})
+    return jsonify({'error': 'Failed to delete'}), 400
+
+@app.route('/api/logs/<task_id>')
+@login_required
+def api_logs(task_id):
+    if task_id not in task_manager.tasks:
+        return jsonify({'logs': []})
+    if task_manager.tasks[task_id].username != session.get('username'):
+        return jsonify({'logs': []})
+    logs = list(task_logs.get(task_id, []))
+    return jsonify({'logs': logs[-100:]})
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'alive', 'tasks': len(task_manager.tasks)})
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    print("=" * 50)
+    print("🤖 Facebook Message Bot - Web UI")
+    print("=" * 50)
+    print(f"📍 Access at: http://localhost:{PORT}")
+    print(f"🔑 Default login: admin / admin123")
+    print("=" * 50)
+    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
