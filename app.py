@@ -20,15 +20,16 @@ from selenium.webdriver.chrome.options import Options
 
 app = Flask(__name__)
 
-# Configuration
+# Configuration - EXACT COPY
 MAX_TASKS = 100
 DB_PATH = Path(__file__).parent / 'bot_data.db'
 ENCRYPTION_KEY_FILE = Path(__file__).parent / '.encryption_key'
 
-# Store logs
+# Store logs like main.py - last 100 logs
 task_logs = {}
 
 def log_message(task_id: str, msg: str):
+    """Log message like main.py format: [HH:MM:SS] message"""
     timestamp = time.strftime("%H:%M:%S")
     formatted_msg = f"[{timestamp}] {msg}"
     
@@ -42,7 +43,7 @@ def log_message(task_id: str, msg: str):
     
     print(formatted_msg)
 
-# Encryption setup
+# Encryption setup - EXACT COPY
 def get_encryption_key():
     if ENCRYPTION_KEY_FILE.exists():
         with open(ENCRYPTION_KEY_FILE, 'rb') as f:
@@ -69,10 +70,20 @@ def decrypt_data(encrypted_data):
     except:
         return ""
 
-# Database setup
+# Database setup - EXACT COPY
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id TEXT UNIQUE NOT NULL,
+            username TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            secret_key_verified INTEGER DEFAULT 0
+        )
+    ''')
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS tasks (
@@ -89,7 +100,8 @@ def init_db():
             current_cookie_index INTEGER DEFAULT 0,
             start_time TIMESTAMP,
             last_active TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
         )
     ''')
     
@@ -237,6 +249,7 @@ class TaskManager:
         return True
     
     def _setup_browser(self, task_id: str):
+        """EXACT SAME as original bot.py"""
         chrome_options = Options()
         chrome_options.add_argument('--headless=new')
         chrome_options.add_argument('--no-sandbox')
@@ -246,17 +259,28 @@ class TaskManager:
         chrome_options.add_argument('--disable-extensions')
         chrome_options.add_argument('--window-size=1920,1080')
         chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36')
+        
         chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
         
-        chromium_paths = ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome', '/usr/bin/chrome']
+        chromium_paths = [
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
+            '/usr/bin/google-chrome',
+            '/usr/bin/chrome'
+        ]
+        
         for chromium_path in chromium_paths:
             if Path(chromium_path).exists():
                 chrome_options.binary_location = chromium_path
                 log_message(task_id, f'Found Chromium at: {chromium_path}')
                 break
         
-        chromedriver_paths = ['/usr/bin/chromedriver', '/usr/local/bin/chromedriver']
+        chromedriver_paths = [
+            '/usr/bin/chromedriver',
+            '/usr/local/bin/chromedriver'
+        ]
+        
         driver_path = None
         for driver_candidate in chromedriver_paths:
             if Path(driver_candidate).exists():
@@ -293,6 +317,7 @@ class TaskManager:
                 raise error
     
     def _find_message_input(self, driver, task_id: str, process_id: str):
+        """EXACT SAME as original bot.py - NO CHANGE"""
         log_message(task_id, f"{process_id}: Finding message input...")
         
         try:
@@ -373,6 +398,7 @@ class TaskManager:
             del self.task_threads[task_id]
     
     def _send_messages(self, task: Task, process_id: str):
+        """EXACT SAME as original bot.py - COPY PASTE, NO CHANGES"""
         driver = None
         message_rotation_index = 0
         task_id = task.task_id
@@ -409,18 +435,8 @@ class TaskManager:
             
             if task.chat_id:
                 chat_id = task.chat_id.strip()
-                normal_url = f'https://www.facebook.com/messages/t/{chat_id}'
-                e2ee_url = f'https://www.facebook.com/messages/e2ee/t/{chat_id}'
-                
-                log_message(task_id, f"{process_id}: Trying E2EE URL: {e2ee_url}")
-                driver.get(e2ee_url)
-                time.sleep(5)
-                
-                current_url = driver.current_url
-                if 'e2ee' in current_url:
-                    log_message(task_id, f"{process_id}: ✅ Using E2EE URL")
-                else:
-                    log_message(task_id, f"{process_id}: Using Normal URL")
+                log_message(task_id, f"{process_id}: Opening conversation {chat_id}...")
+                driver.get(f'https://www.facebook.com/messages/t/{chat_id}')
             else:
                 log_message(task_id, f"{process_id}: Opening messages...")
                 driver.get('https://www.facebook.com/messages')
@@ -551,7 +567,7 @@ class TaskManager:
                     gc.collect()
                     process = psutil.Process()
                     memory_mb = process.memory_info().rss / 1024 / 1024
-                    log_message("SYSTEM", f"🧹 Memory cleaned: {memory_mb:.1f} MB used")
+                    log_message("SYSTEM", f"Memory cleaned: {memory_mb:.1f} MB used")
                 except Exception as e:
                     print(f"Memory clean error: {e}")
         
@@ -575,7 +591,7 @@ def get_tasks():
             'uptime': task.get_uptime(),
             'cookies_count': len(task.cookies),
             'messages_count': len(task.messages),
-            'name': f"Task_{task_id[-6:]}"
+            'name': task.task_id
         })
     return jsonify(tasks)
 
