@@ -1,4 +1,4 @@
-# bot_webui.py - EXACT ORIGINAL + ONLY MEMORY FIX (No extra changes)
+# bot_webui.py - Flask Web UI with EXACT original bot.py logic + Auto Recovery
 
 import os
 import sys
@@ -7,7 +7,6 @@ import json
 import random
 import sqlite3
 import threading
-import gc
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -106,6 +105,7 @@ def init_db():
         )
     ''')
     
+    # Create default admin user
     import hashlib
     cursor.execute('SELECT * FROM users WHERE username = "admin"')
     if not cursor.fetchone():
@@ -147,7 +147,7 @@ class Task:
             return f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
-# ==================== TASK MANAGER ====================
+# ==================== TASK MANAGER (WITH AUTO RECOVERY) ====================
 class TaskManager:
     def __init__(self):
         self.tasks: Dict[str, Task] = {}
@@ -252,7 +252,7 @@ class TaskManager:
         return True
     
     def _setup_browser(self, task_id: str):
-        """EXACT SAME as original - only memory flags added"""
+        """EXACT SAME as original bot.py - WORKING VERSION with memory optimizations"""
         chrome_options = Options()
         chrome_options.add_argument('--headless=new')
         chrome_options.add_argument('--no-sandbox')
@@ -261,15 +261,20 @@ class TaskManager:
         chrome_options.add_argument('--disable-gpu')
         chrome_options.add_argument('--disable-extensions')
         chrome_options.add_argument('--window-size=1920,1080')
+        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36')
         
-        # ONLY ADDED: Memory optimization flags
+        # Memory optimization flags
+        chrome_options.add_argument('--disable-logging')
+        chrome_options.add_argument('--log-level=3')
+        chrome_options.add_argument('--silent')
         chrome_options.add_argument('--memory-pressure-off')
-        chrome_options.add_argument('--max_old_space_size=128')
+        chrome_options.add_argument('--max_old_space_size=256')
         
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+        # Ghost mode - no active status
         chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
         
+        # Try to find Chromium binary
         chromium_paths = [
             '/usr/bin/chromium',
             '/usr/bin/chromium-browser',
@@ -283,6 +288,7 @@ class TaskManager:
                 log_message(task_id, f'Found Chromium at: {chromium_path}')
                 break
         
+        # Try to find ChromeDriver
         chromedriver_paths = [
             '/usr/bin/chromedriver',
             '/usr/local/bin/chromedriver'
@@ -325,7 +331,7 @@ class TaskManager:
                 raise error
     
     def _find_message_input(self, driver, task_id: str, process_id: str):
-        """EXACT SAME as original"""
+        """EXACT SAME as original bot.py"""
         log_message(task_id, f"{process_id}: Finding message input...")
         
         try:
@@ -390,11 +396,12 @@ class TaskManager:
         return None
     
     def _send_messages(self, task: Task, process_id: str):
-        """EXACT SAME as original - ONLY added memory cleanup every 30 messages"""
+        """EXACT SAME send_messages function from original bot.py + AUTO RECOVERY & MEMORY CLEANUP"""
         driver = None
         message_rotation_index = 0
         task_id = task.task_id
-        message_counter = 0  # ONLY ADDED: For counting messages
+        consecutive_errors = 0
+        messages_sent_in_session = task.messages_sent
         
         try:
             log_message(task_id, f"{process_id}: Starting automation...")
@@ -404,6 +411,7 @@ class TaskManager:
             driver.get('https://www.facebook.com/')
             time.sleep(8)
             
+            # Use first cookie (single cookie mode like original)
             current_cookie = task.cookies[0] if task.cookies else ""
             
             if current_cookie and current_cookie.strip():
@@ -439,12 +447,12 @@ class TaskManager:
             message_input = self._find_message_input(driver, task_id, process_id)
             
             if not message_input:
-                task.status = "stopped"
-                self.save_task(task)
+                log_message(task_id, f"{process_id}: Message input not found, will retry...")
+                # Don't stop, just retry later
+                time.sleep(10)
                 return 0
             
             delay = int(task.delay)
-            messages_sent = 0
             messages_list = [msg.strip() for msg in task.messages if msg.strip()]
             
             if not messages_list:
@@ -453,118 +461,234 @@ class TaskManager:
             log_message(task_id, f"{process_id}: Starting infinite message loop...")
             
             while task.status == "running" and not task.stop_flag:
-                base_message = messages_list[message_rotation_index % len(messages_list)]
-                message_rotation_index += 1
-                
-                if task.name_prefix:
-                    message_to_send = f"{task.name_prefix} {base_message}"
-                else:
-                    message_to_send = base_message
-                
                 try:
-                    driver.execute_script("""
-                        const element = arguments[0];
-                        const message = arguments[1];
-                        
-                        element.scrollIntoView({behavior: 'smooth', block: 'center'});
-                        element.focus();
-                        element.click();
-                        
-                        if (element.tagName === 'DIV') {
-                            element.textContent = message;
-                            element.innerHTML = message;
-                        } else {
-                            element.value = message;
-                        }
-                        
-                        element.dispatchEvent(new Event('input', { bubbles: true }));
-                        element.dispatchEvent(new Event('change', { bubbles: true }));
-                        element.dispatchEvent(new InputEvent('input', { bubbles: true, data: message }));
-                    """, message_input, message_to_send)
+                    base_message = messages_list[message_rotation_index % len(messages_list)]
+                    message_rotation_index += 1
                     
-                    time.sleep(1)
+                    if task.name_prefix:
+                        message_to_send = f"{task.name_prefix} {base_message}"
+                    else:
+                        message_to_send = base_message
                     
-                    sent = driver.execute_script("""
-                        const sendButtons = document.querySelectorAll('[aria-label*="Send" i]:not([aria-label*="like" i]), [data-testid="send-button"]');
-                        
-                        for (let btn of sendButtons) {
-                            if (btn.offsetParent !== null) {
-                                btn.click();
-                                return 'button_clicked';
-                            }
-                        }
-                        return 'button_not_found';
-                    """)
-                    
-                    if sent == 'button_not_found':
+                    try:
                         driver.execute_script("""
                             const element = arguments[0];
+                            const message = arguments[1];
+                            
+                            element.scrollIntoView({behavior: 'smooth', block: 'center'});
                             element.focus();
+                            element.click();
                             
-                            const events = [
-                                new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }),
-                                new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }),
-                                new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })
-                            ];
+                            if (element.tagName === 'DIV') {
+                                element.textContent = message;
+                                element.innerHTML = message;
+                            } else {
+                                element.value = message;
+                            }
                             
-                            events.forEach(event => element.dispatchEvent(event));
-                        """, message_input)
-                        log_message(task_id, f"{process_id}: ✅ Sent via Enter: \"{message_to_send[:30]}...\"")
-                    else:
-                        log_message(task_id, f"{process_id}: ✅ Sent via button: \"{message_to_send[:30]}...\"")
+                            element.dispatchEvent(new Event('input', { bubbles: true }));
+                            element.dispatchEvent(new Event('change', { bubbles: true }));
+                            element.dispatchEvent(new InputEvent('input', { bubbles: true, data: message }));
+                        """, message_input, message_to_send)
+                        
+                        time.sleep(1)
+                        
+                        sent = driver.execute_script("""
+                            const sendButtons = document.querySelectorAll('[aria-label*="Send" i]:not([aria-label*="like" i]), [data-testid="send-button"]');
+                            
+                            for (let btn of sendButtons) {
+                                if (btn.offsetParent !== null) {
+                                    btn.click();
+                                    return 'button_clicked';
+                                }
+                            }
+                            return 'button_not_found';
+                        """)
+                        
+                        if sent == 'button_not_found':
+                            driver.execute_script("""
+                                const element = arguments[0];
+                                element.focus();
+                                
+                                const events = [
+                                    new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }),
+                                    new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }),
+                                    new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })
+                                ];
+                                
+                                events.forEach(event => element.dispatchEvent(event));
+                            """, message_input)
+                            log_message(task_id, f"{process_id}: ✅ Sent via Enter: \"{message_to_send[:30]}...\"")
+                        else:
+                            log_message(task_id, f"{process_id}: ✅ Sent via button: \"{message_to_send[:30]}...\"")
+                        
+                        messages_sent_in_session += 1
+                        task.messages_sent = messages_sent_in_session
+                        task.last_active = datetime.now()
+                        self.save_task(task)
+                        consecutive_errors = 0  # Reset error counter on success
+                        
+                        log_message(task_id, f"{process_id}: Message #{messages_sent_in_session} sent. Waiting {delay}s...")
+                        
+                        # MEMORY CLEANUP: Har 20 messages ke baad browser restart quietly
+                        if messages_sent_in_session % 20 == 0:
+                            log_message(task_id, f"{process_id}: Memory cleanup - restarting browser...")
+                            try:
+                                driver.quit()
+                            except:
+                                pass
+                            time.sleep(5)
+                            
+                            driver = self._setup_browser(task_id)
+                            driver.get('https://www.facebook.com/')
+                            time.sleep(5)
+                            
+                            # Re-add cookies
+                            if current_cookie:
+                                for cookie in current_cookie.split(';'):
+                                    if cookie.strip() and '=' in cookie:
+                                        name, value = cookie.strip().split('=', 1)
+                                        try:
+                                            driver.add_cookie({'name': name, 'value': value, 'domain': '.facebook.com'})
+                                        except:
+                                            pass
+                            
+                            # Re-open chat
+                            if task.chat_id:
+                                driver.get(f'https://www.facebook.com/messages/t/{task.chat_id}')
+                            else:
+                                driver.get('https://www.facebook.com/messages')
+                            
+                            time.sleep(10)
+                            
+                            # Re-find message input
+                            message_input = self._find_message_input(driver, task_id, process_id)
+                            if not message_input:
+                                log_message(task_id, f"{process_id}: Message input lost after restart, will retry...")
+                                time.sleep(10)
+                                continue
+                            
+                            log_message(task_id, f"{process_id}: Browser restarted successfully")
+                        
+                        time.sleep(delay)
+                        
+                    except Exception as e:
+                        consecutive_errors += 1
+                        log_message(task_id, f"{process_id}: Send error ({consecutive_errors}): {str(e)[:100]}")
+                        
+                        # AUTO RECOVERY: Browser restart on error
+                        if consecutive_errors >= 3:
+                            log_message(task_id, f"{process_id}: Too many errors, restarting browser...")
+                            try:
+                                driver.quit()
+                            except:
+                                pass
+                            time.sleep(10)
+                            
+                            driver = self._setup_browser(task_id)
+                            driver.get('https://www.facebook.com/')
+                            time.sleep(5)
+                            
+                            if current_cookie:
+                                for cookie in current_cookie.split(';'):
+                                    if cookie.strip() and '=' in cookie:
+                                        name, value = cookie.strip().split('=', 1)
+                                        try:
+                                            driver.add_cookie({'name': name, 'value': value, 'domain': '.facebook.com'})
+                                        except:
+                                            pass
+                            
+                            if task.chat_id:
+                                driver.get(f'https://www.facebook.com/messages/t/{task.chat_id}')
+                            else:
+                                driver.get('https://www.facebook.com/messages')
+                            
+                            time.sleep(10)
+                            message_input = self._find_message_input(driver, task_id, process_id)
+                            consecutive_errors = 0
+                            log_message(task_id, f"{process_id}: Browser restarted after errors")
+                        
+                        time.sleep(5)
+                
+                except Exception as loop_error:
+                    log_message(task_id, f"{process_id}: Loop error: {str(loop_error)[:100]}")
+                    time.sleep(10)
                     
-                    messages_sent += 1
-                    message_counter += 1  # ONLY ADDED: Increment counter
-                    task.messages_sent = messages_sent
-                    task.last_active = datetime.now()
-                    self.save_task(task)
-                    
-                    log_message(task_id, f"{process_id}: Message #{messages_sent} sent. Waiting {delay}s...")
-                    
-                    # ONLY ADDED: Memory cleanup every 30 messages (not after every message)
-                    if message_counter >= 30:
-                        log_message(task_id, f"{process_id}: Running memory cleanup (30 messages sent)...")
-                        gc.collect()
-                        message_counter = 0
-                        log_message(task_id, f"{process_id}: Memory cleanup completed")
-                    
-                    time.sleep(delay)
-                    
-                except Exception as e:
-                    log_message(task_id, f"{process_id}: Send error: {str(e)[:100]}")
+                    # Force browser restart on fatal loop error
+                    try:
+                        driver.quit()
+                    except:
+                        pass
                     time.sleep(5)
+                    
+                    driver = self._setup_browser(task_id)
+                    driver.get('https://www.facebook.com/')
+                    time.sleep(5)
+                    
+                    if current_cookie:
+                        for cookie in current_cookie.split(';'):
+                            if cookie.strip() and '=' in cookie:
+                                name, value = cookie.strip().split('=', 1)
+                                try:
+                                    driver.add_cookie({'name': name, 'value': value, 'domain': '.facebook.com'})
+                                except:
+                                    pass
+                    
+                    if task.chat_id:
+                        driver.get(f'https://www.facebook.com/messages/t/{task.chat_id}')
+                    else:
+                        driver.get('https://www.facebook.com/messages')
+                    
+                    time.sleep(10)
+                    message_input = self._find_message_input(driver, task_id, process_id)
             
-            log_message(task_id, f"{process_id}: Automation stopped. Total messages: {messages_sent}")
-            return messages_sent
+            log_message(task_id, f"{process_id}: Automation stopped. Total messages: {messages_sent_in_session}")
+            return messages_sent_in_session - task.messages_sent
             
         except Exception as e:
             log_message(task_id, f"{process_id}: Fatal error: {str(e)}")
-            task.status = "stopped"
-            self.save_task(task)
+            # AUTO RECOVERY: Don't stop, just return and let main loop restart
+            time.sleep(30)
             return 0
         finally:
             if driver:
                 try:
                     driver.quit()
-                    log_message(task_id, f"{process_id}: Browser closed")
                 except:
                     pass
     
     def _run_task(self, task_id: str):
+        """Main task loop with auto-recovery - WILL NEVER STOP ON ITS OWN"""
         task = self.tasks[task_id]
         task.running = True
         process_id = f"TASK-{task_id[-6:]}"
         
+        # INFINITE LOOP WITH AUTO RECOVERY
         while task.status == "running" and not task.stop_flag:
             try:
-                self._send_messages(task, process_id)
+                result = self._send_messages(task, process_id)
+                
+                # If _send_messages returned 0, it means something failed
+                # Wait and retry automatically
+                if result == 0:
+                    log_message(task_id, f"{process_id}: Session returned 0, retrying in 30 seconds...")
+                    time.sleep(30)
+                    continue
+                    
             except Exception as e:
-                log_message(task_id, f"ERROR: {str(e)[:100]}")
-                time.sleep(5)
+                log_message(task_id, f"{process_id}: CRITICAL ERROR in task loop: {str(e)[:100]}")
+                log_message(task_id, f"{process_id}: Auto-recovering in 60 seconds...")
+                time.sleep(60)
+                # Force a small cleanup
+                import gc
+                gc.collect()
+                continue
         
         task.running = False
         if task_id in self.task_threads:
             del self.task_threads[task_id]
+        
+        log_message(task_id, f"{process_id}: Task thread ended")
 
 task_manager = TaskManager()
 
@@ -580,7 +704,7 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# HTML Template (same as before)
+# HTML Template
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
